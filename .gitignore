@@ -197,6 +197,6 @@ data/
 data_preprocessing/
 figure/
 models
-model_deployment/
+model_development/
 model_evaluation/
 notebook.ipynb
