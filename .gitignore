@@ -194,9 +194,4 @@ cython_debug/
 .cursorindexingignore
 notebook.ipynb
 data/
-data_preprocessing/
-figure/
-models
-model_development/
-model_evaluation/
-notebook.ipynb
+
