@@ -94,13 +94,32 @@ def plot_forest(model, X, path):
 
 # -------- Save Metrics --------
 def save_metrics(model, X, y):
+    model_step = model.named_steps["model"]
     cindex = concordance_index_censored(y["status"], y["trial_duration_days"], model.predict(X))[0]
     n_events = np.sum(y["status"])
+
+    # Extract the best alpha index and coefficients
+    best_alpha_index = model_step.alphas_.argmin()
+    alpha = model_step.alphas_[best_alpha_index]
+    coefs = model_step.coef_[:, best_alpha_index]
+    non_zero = np.sum(coefs != 0)
+
+    metrics = {
+        "model": "cox_lasso",
+        "best_alpha": float(alpha),
+        "non_zero_features": int(non_zero),
+        "concordance_index": float(cindex),
+        "n_events": int(n_events),
+        "n_observations": int(len(y))
+    }
+
     METRIC_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(METRIC_PATH, "w") as f:
-        f.write(f"C-index: {cindex:.4f}\n")
-        f.write(f"Events: {n_events} / Observations: {len(y)}\n")
+        for k, v in metrics.items():
+            f.write(f"{k}: {v}\n")
+
     print(f"Saved metrics to {METRIC_PATH}")
+
 
 # -------- Main --------
 if __name__ == "__main__":

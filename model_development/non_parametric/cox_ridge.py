@@ -85,21 +85,32 @@ def plot_forest(cph):
     plt.savefig(FIGURE_PATH)
     plt.close()
 
-# -------- Save Model Metrics --------
-def save_metrics(cph, df):
+# -------- Save Metrics --------
+def save_metrics(model, df, penalizer_value):
+    cindex = model.concordance_index_
+    n_events = df["status"].sum()
+    n_obs = len(df)
+    coefs = model.params_
+    total_features = len(coefs)
+    non_zero = (np.abs(coefs) > 1e-6).sum()
+
+    metrics = {
+        "model": "cox_ridge",
+        "best_alpha": float(penalizer_value),
+        "non_zero_features": int(non_zero),
+        "total_features": int(total_features),
+        "concordance_index": float(cindex),
+        "n_events": int(n_events),
+        "n_observations": int(n_obs)
+    }
+
     METRIC_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(METRIC_PATH, "w") as f:
-        f.write(f"C-index: {cph.concordance_index_:.4f}\n")
-        f.write(f"Partial log-likelihood: {cph.log_likelihood_:.2f}\n")
-        f.write(f"AIC (partial): {cph.AIC_partial_:.2f}\n")
-        f.write(f"Events: {df['status'].sum()} / Observations: {df.shape[0]}\n")
+        for k, v in metrics.items():
+            f.write(f"{k}: {v}\n")
 
-    print("\n Model Performance Metrics:")
-    print(f"C-index: {cph.concordance_index_:.4f}")
-    print(f"Partial log-likelihood: {cph.log_likelihood_:.2f}")
-    print(f"AIC (partial): {cph.AIC_partial_:.2f}")
-    print(f"Events: {df['status'].sum()} / Observations: {df.shape[0]}")
-    print(f"Metrics saved to: {METRIC_PATH}")
+    print(f"Saved metrics to {METRIC_PATH}")
+
 
 # -------- Mixed Predictor Selector --------
 def select_mixed_predictors(df, cph, top_cat=6, top_cont=3, min_group_size=100):
@@ -210,7 +221,7 @@ if __name__ == "__main__":
     SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     cph.summary.to_csv(SUMMARY_PATH)
     plot_forest(cph)
-    save_metrics(cph, df)
+    save_metrics(cph, df, penalizer)
 
     selected_vars = select_mixed_predictors(df, cph, top_cat=6, top_cont=3)
     plot_partial_risk_by_top_predictors(cph, df, selected_vars)

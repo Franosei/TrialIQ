@@ -1,160 +1,140 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+from lifelines.utils import concordance_index
 from pathlib import Path
 import joblib
-from lifelines import WeibullAFTFitter, LogLogisticAFTFitter, LogNormalAFTFitter
 
-# ---------------- File Paths ----------------
-DATA_PATH = Path("data/train_trials.csv")
-MODEL_SAVE = Path("models/parametric_model.pkl")
-SUMMARY_PATH = Path("data/parametric_model_summary.csv")
-COMPARISON_PATH = Path("data/parametric_model_comparison.csv")
-FIGURE_PATH = Path("figure/parametric_stratified_grid.png")
+# -------- File Paths --------
+TEST_PATH = Path("data/test_trials.csv")
+MODEL_PATH = Path("models/parametric_model.pkl")
+FEATURES_PATH = Path("models/parametric_features.pkl")
+METRIC_PATH = Path("data/parametric_model_test_metrics.txt")
 
-# ---------------- Load & Preprocess ----------------
-def load_and_preprocess(path):
+# -------- Load and Preprocess Data (same as Cox logic) --------
+def load_clean_data(path):
     df = pd.read_csv(path)
-    before_all = len(df)
-    df = df.dropna(subset=["trial_duration_days", "status"])
-    df = df[df["trial_duration_days"] > 0].copy()
-    df = df.drop(columns=["nct_id"], errors="ignore")
+    df = df[df["trial_duration_days"].notnull()]
+    df["trial_duration_days"] = df["trial_duration_days"].astype(int)
     df["status"] = df["status"].astype(int)
-
-    print(f"Initial rows after dropna & filtering: {len(df)} (from original {before_all})")
+    df = df.drop(columns=["nct_id", "condition_group_count"], errors="ignore")
     return df
 
-# ---------------- Model Training with Penalizer Tuning ----------------
-def train_with_penalizers(df, model_class, name, penalizers=[0.001, 0.010, 0.100, 0.500, 1.000]):
-    best_model = None
-    best_result = None
-    best_cindex = -np.inf
+# -------- Align Test Features --------
+def align_and_filter(df, model_features):
+    for col in model_features:
+        if col not in df.columns:
+            df[col] = 0.0
+    keep_cols = model_features + ["trial_duration_days", "status"]
+    df = df[keep_cols]
+    df = df.dropna()  # Same as Cox: drop rows with NaNs only in required cols
+    return df
 
-    for pen in penalizers:
-        model = model_class(penalizer=pen)
+# -------- Fairness Evaluation --------
+def evaluate_c_index_by_group(df_raw, preds, group_col, is_continuous=False, bins=3):
+    print(f"\nFairness Evaluation by '{group_col}':")
+    results = []
+
+    if is_continuous:
+        labels = ["Low", "Mid", "High"][:bins]
         try:
-            model.fit(df, duration_col="trial_duration_days", event_col="status")
-            cindex = model.score(df, scoring_method='concordance_index')
-            result = {
-                "model": name,
-                "penalizer": pen,
-                "aic": model.AIC_,
-                "log_likelihood": model.log_likelihood_,
-                "concordance_index": cindex
-            }
-            print(f"{name} (penalizer={pen:.4f}): AIC={model.AIC_:.2f}, CI={cindex:.3f}")
-            if cindex > best_cindex:
-                best_model = model
-                best_result = result
-                best_cindex = cindex
+            df_raw[f"{group_col}_binned"] = pd.qcut(df_raw[group_col], q=bins, labels=labels, duplicates='drop')
         except Exception as e:
-            print(f"{name} (penalizer={pen:.4f}) failed: {e}")
-    
-    return best_model, best_result
+            print(f"  Skipping {group_col} — binning failed: {e}")
+            return []
+        eval_col = f"{group_col}_binned"
+    else:
+        eval_col = group_col
 
-# ---------------- Train All Models ----------------
-def train_aft_models(df):
-    model_classes = {
-        "weibull": WeibullAFTFitter,
-        "loglogistic": LogLogisticAFTFitter,
-        "lognormal": LogNormalAFTFitter
-    }
+    unique_groups = df_raw[eval_col].dropna().unique()
+    for group in unique_groups:
+        mask = df_raw[eval_col] == group
+        if mask.sum() < 10:
+            continue
+        ci = concordance_index(
+            df_raw.loc[mask, "trial_duration_days"],
+            -preds[mask],
+            df_raw.loc[mask, "status"]
+        )
+        results.append((group, mask.sum(), df_raw.loc[mask, "status"].sum(), ci))
+        print(f"  {str(group):20}  N={mask.sum():3}  Events={df_raw.loc[mask, 'status'].sum():3}  C-index={ci:.4f}")
+    return results
 
-    all_results = []
-    fitted_models = {}
-
-    for name, cls in model_classes.items():
-        model, result = train_with_penalizers(df, cls, name)
-        if model:
-            fitted_models[name] = model
-            all_results.append(result)
-    
-    result_df = pd.DataFrame(all_results)
-    result_df.to_csv(COMPARISON_PATH, index=False)
-    return fitted_models, result_df
-
-# ---------------- Plot Stratified Survival Curves ----------------
-def plot_stratified_survival_grid_parametric(model, df, duration_col, event_col, top_n=9):
-    summary = model.summary.copy()
-    try:
-        lambda_df = summary.loc["lambda_"]
-        lambda_df = lambda_df.drop(index="Intercept", errors="ignore")
-        lambda_df["abs_coef"] = lambda_df["coef"].abs()
-        top_features = lambda_df.sort_values("abs_coef", ascending=False).head(top_n).index.tolist()
-    except:
-        print("Failed to extract lambda_ terms from summary.")
-        return
-
-    rows, cols = 3, 3
-    fig, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
-
-    for i, feat in enumerate(top_features):
-        if i >= rows * cols: break
-        row, col = divmod(i, cols)
-        ax = axs[row][col]
-
-        try:
-            if df[feat].nunique() <= 1:
-                ax.set_title(f"{feat} (no variation)")
-                ax.axis('off')
-                continue
-
-            if df[feat].nunique() <= 4:
-                df['risk_group'] = df[feat].astype(str)
-            else:
-                df['risk_group'] = pd.qcut(df[feat], q=4, duplicates='drop')
-
-            times = np.linspace(0, df[duration_col].max(), 1000)
-
-            for group in df['risk_group'].unique():
-                subset = df[df['risk_group'] == group]
-                if len(subset) < 5: continue
-                surv = model.predict_survival_function(subset, times=times)
-                mean_surv = surv.mean(axis=1)
-                ax.plot(mean_surv.index, mean_surv.values, label=str(group))
-
-            ax.set_title(f"Partial Risk by '{feat}'")
-            ax.set_xlabel("Time (days)")
-            ax.set_ylabel("Survival Probability")
-            ax.grid(True)
-            ax.legend(fontsize=8)
-        except Exception as e:
-            ax.set_title(f"{feat} (Error)")
-            ax.axis('off')
-            print(f"Skipped {feat}: {e}")
-
-    for j in range(i + 1, rows * cols):
-        r, c = divmod(j, cols)
-        fig.delaxes(axs[r][c])
-
-    plt.tight_layout()
-    plt.suptitle("Stratified Survival Curves by Top Predictors (Parametric)", fontsize=14, y=1.02)
-    FIGURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(FIGURE_PATH, bbox_inches='tight')
-    plt.close()
-
-# ---------------- Main ----------------
+# -------- Main Evaluation --------
 if __name__ == "__main__":
-    print("Loading and preprocessing data...")
-    df = load_and_preprocess(DATA_PATH)
+    print("Loading test data...")
+    df_raw = load_clean_data(TEST_PATH)
 
-    print("Fitting AFT models with penalizer tuning...")
-    fitted_models, result_df = train_aft_models(df)
+    print("Loading trained parametric model...")
+    model = joblib.load(MODEL_PATH)
 
-    if result_df.empty:
-        print("No model trained successfully. Exiting.")
+    print("Loading feature list used during training...")
+    model_features = joblib.load(FEATURES_PATH)
+
+    print("Aligning and filtering test data to match model features...")
+    df_model = align_and_filter(df_raw.copy(), model_features)
+
+    print("Predicting and evaluating concordance index...")
+    try:
+        preds = model.predict_median(df_model)
+        c_index = concordance_index(
+            df_model["trial_duration_days"],
+            -preds,
+            df_model["status"]
+        )
+    except Exception as e:
+        print(f"Model prediction failed: {e}")
         exit(1)
 
-    best_model_name = result_df.sort_values("aic").iloc[0]['model']
-    best_model = fitted_models[best_model_name]
-    print(f"Best model: {best_model_name}")
+    num_events = df_model["status"].sum()
+    num_total = df_model.shape[0]
 
-    print("Saving model and summary...")
-    MODEL_SAVE.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(best_model, MODEL_SAVE)
-    best_model.summary.to_csv(SUMMARY_PATH)
+    print(f"\nGlobal C-index: {c_index:.4f}")
+    print(f"Events: {num_events} / Observations: {num_total}")
 
-    print("Generating stratified survival plots...")
-    plot_stratified_survival_grid_parametric(best_model, df, "trial_duration_days", "status")
+    METRIC_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(METRIC_PATH, "w") as f:
+        f.write(f"Global C-index: {c_index:.4f}\n")
+        f.write(f"Events: {num_events} / Observations: {num_total}\n")
 
-    print(f"Done. Best model: {best_model_name}, plot saved to: {FIGURE_PATH}")
+    # -------- Fairness Evaluation --------
+    categorical_group_cols = [
+        "sponsor_class_category_industry",
+        "is_fda_regulated_drug_true",
+        "c08",
+        "has_expanded_access_true",
+        "intervention_model_category_parallel",
+        "intervention_model_category_crossover",
+        "intervention_grouped_category_behavioral/lifestyle",
+        "is_fda_regulated_drug_none"
+    ]
+
+    continuous_group_cols = [
+        "site_count", 
+        "maximum_age",
+        "collaborator_count",
+        "arm_count",
+        "eligibility_token_count",
+        "exclusion_criteria_count",
+        "secondary_outcome_count"
+    ]
+
+    # Use filtered version of raw data (same rows as df_model)
+    df_eval = df_raw.loc[df_model.index]
+
+    for group_col in categorical_group_cols:
+        if group_col in df_eval.columns:
+            results = evaluate_c_index_by_group(df_eval, preds, group_col, is_continuous=False)
+            with open(METRIC_PATH, "a") as f:
+                f.write(f"\nFairness Evaluation by '{group_col}':\n")
+                for group, n, ev, ci in results:
+                    f.write(f"  {group:20}  N={n:3}  Events={ev:3}  C-index={ci:.4f}\n")
+
+    for group_col in continuous_group_cols:
+        if group_col in df_eval.columns:
+            results = evaluate_c_index_by_group(df_eval, preds, group_col, is_continuous=True, bins=3)
+            with open(METRIC_PATH, "a") as f:
+                f.write(f"\nFairness Evaluation by binned '{group_col}':\n")
+                for group, n, ev, ci in results:
+                    f.write(f"  {group:20}  N={n:3}  Events={ev:3}  C-index={ci:.4f}\n")
+
+    print(f"\nAll results saved to: {METRIC_PATH}")
