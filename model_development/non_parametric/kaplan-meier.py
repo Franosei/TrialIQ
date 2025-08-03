@@ -15,14 +15,14 @@ PHASE_COLS = [
     "phase_phase3", "phase_phase4"
 ]
 
-# ------------ GET PHASE LABEL ------------
+# ------------ GET PHASE LABEL ------------ 
 def get_phase(row):
     for col in reversed(PHASE_COLS):  # Phase 4 > Phase 3 > ...
         if row.get(col, 0) == 1:
             return col.replace("phase_", "").upper()
     return "UNKNOWN"
 
-# ------------ MAIN FUNCTION ------------
+# ------------ MAIN FUNCTION ------------ 
 def run_kaplan_meier():
     df = pd.read_csv(DATA_PATH)
     df = df[df["trial_duration_days"].notnull()]
@@ -49,11 +49,13 @@ def run_kaplan_meier():
             if mask.sum() == 0:
                 continue
 
+            n = mask.sum()
+            label = f"{sponsor} (n={n})"
+
             kmf = KaplanMeierFitter()
-            kmf.fit(T[mask], E[mask], label=sponsor)
+            kmf.fit(T[mask], E[mask], label=label)
             kmf.plot_survival_function(ax=ax)
 
-            n = mask.sum()
             events = E[mask].sum()
             censoring = 1 - (events / n)
             median = kmf.median_survival_time_
@@ -100,6 +102,6 @@ def run_kaplan_meier():
     print(f"Figure saved to: {FIGURE_PATH}")
     print(f"Summary saved to: {SUMMARY_PATH}")
 
-# ------------ RUN ------------
+# ------------ RUN ------------ 
 if __name__ == "__main__":
     run_kaplan_meier()
